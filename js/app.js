@@ -6,8 +6,8 @@
    ========================================================= */
 const $ = s => document.querySelector(s);
 const SW = 76;          // szerokość jednego miejsca
-const SEAT_H = 46;      // wysokość miejsca
-const BODY_H = 64;      // wysokość blatu stołu
+const SEAT_H = 72;      // wysokość miejsca
+const BODY_H = 80;      // wysokość blatu stołu
 const ROOM_W = 3200, ROOM_H = 2200, GRID = 10;
 const KEY = 'plan-wesela-v1', ZKEY = 'plan-wesela-zoom';
 
@@ -17,7 +17,7 @@ function store(k, v){ try{ localStorage.setItem(k, typeof v === 'string' ? v : J
 function fetchStored(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
 
 let state = load() || sampleState();
-const ui = { selTable: null, selGuest: null, search: '', zoom: parseFloat(fetchStored(ZKEY)) || 0.85, busy: false };
+const ui = { selTable: null, selGuest: null, search: '', zoom: parseFloat(fetchStored(ZKEY)) || 0.85, busy: false, seatEdit: null };
 let undoStack = [], redoStack = [];
 let occ = new Map();
 
@@ -39,7 +39,7 @@ function validState(s){
   if(!('tables' in s) && !('guests' in s) && typeof s.nextId !== 'number') return null;
   s.tables = toArr(s.tables);
   s.guests = toArr(s.guests);
-  s.tables.forEach(t => { t.n = t.n || 1; t.sides = t.sides || 2; });
+  s.tables.forEach(t => { t.n = t.n || 1; t.sides = t.sides || 2; t.rot = ((Math.round(+t.rot || 0) % 360) + 360) % 360; t.blocked = toArr(t.blocked).filter(k => typeof k === 'string'); });
   s.guests.forEach(g => {
     g.partnerId = g.partnerId ?? null;
     g.tableId = g.tableId ?? null;
@@ -123,7 +123,8 @@ function seatsOf(t){
   const arr = [];
   for(let i = 0; i < t.n; i++) arr.push('t' + i);
   if(t.sides === 2) for(let i = 0; i < t.n; i++) arr.push('b' + i);
-  return arr;
+  const off = new Set(t.blocked || []);      // miejsca usunięte ze stołu
+  return arr.filter(k => !off.has(k));
 }
 function seatLabel(t, key){
   const pos = +key.slice(1) + 1;
@@ -131,7 +132,41 @@ function seatLabel(t, key){
   return (key[0] === 't' ? 'góra ' : 'dół ') + pos;
 }
 function tableHeight(t){ return SEAT_H * (t.sides === 2 ? 2 : 1) + BODY_H + 4; }
-function seatCount(t){ return t.n * (t.sides === 2 ? 2 : 1); }
+
+/* ---------- obrót stołu ---------- */
+function normAngle(a){ return ((Math.round(a) % 360) + 360) % 360; }
+function horizOn(){ return state.horizText !== false; }   // przełącznik „Napisy poziomo” (domyślnie włączony)
+function applyRot(el, t){
+  el.style.transform = t.rot ? 'rotate(' + t.rot + 'deg)' : '';   // cały stół, razem z miejscami
+  // imiona i numery miejsc cofamy o najbliższy kąt prosty, więc przy 90°/180°/270° są poziome
+  const q = Math.round((t.rot || 0) / 90) * 90;
+  el.style.setProperty('--ur', horizOn() ? (-q) + 'deg' : '0deg');
+  // stół „pionowy” (90°/270°): napis na blacie zawija się, żeby zmieścić się w wąskim blacie
+  el.classList.toggle('vert', horizOn() && Math.abs(q) % 180 !== 0);
+}
+// prostokąt otaczający stół po obrocie (współrzędne sali)
+function rotBox(t){
+  const w = t.n * SW, hh = tableHeight(t), r = (t.rot || 0) * Math.PI / 180;
+  const c = Math.abs(Math.cos(r)), s = Math.abs(Math.sin(r));
+  return { cx: t.x + w / 2, cy: t.y + hh / 2, hw: (w * c + hh * s) / 2, hh: (w * s + hh * c) / 2 };
+}
+// trzyma obrócony stół w granicach sali; zwraca nową pozycję lewego górnego rogu (przed obrotem)
+function clampTable(t, x, y){
+  const w = t.n * SW, hh = tableHeight(t);
+  const b = rotBox({ n: t.n, sides: t.sides, rot: t.rot, x, y });
+  const cx = clamp(b.cx, b.hw, ROOM_W - b.hw), cy = clamp(b.cy, b.hh, ROOM_H - b.hh);
+  return { x: cx - w / 2, y: cy - hh / 2 };
+}
+// zmiana długości stołu tak, by jego lewy koniec został w miejscu także po obrocie
+function resizeTable(t, n){
+  const th = (t.rot || 0) * Math.PI / 180, cs = Math.cos(th), sn = Math.sin(th), hh = tableHeight(t);
+  const w0 = t.n * SW, w1 = n * SW;
+  const ax = t.x + w0 / 2 - (w0 / 2) * cs, ay = t.y + hh / 2 - (w0 / 2) * sn;
+  t.n = n;
+  const c = clampTable(t, Math.round(ax + (w1 / 2) * cs - w1 / 2), Math.round(ay + (w1 / 2) * sn - hh / 2));
+  t.x = c.x; t.y = c.y;
+}
+function seatCount(t){ return seatsOf(t).length; }
 function usedCount(t){ return state.guests.filter(g => g.tableId === t.id).length; }
 
 // usuwa gości z miejsc, które przestały istnieć (po zmianie długości stołu)
@@ -248,13 +283,29 @@ function redo(){
   state = JSON.parse(s); fixSelection(); save(); render();
 }
 
+// usuwa miejsce ze stołu albo je przywraca (tryb „Usuń miejsca”)
+function toggleSeat(tid, key){
+  const t = tableById(tid);
+  if(!t) return;
+  act(() => {
+    const bl = (t.blocked || []).slice();
+    const i = bl.indexOf(key);
+    if(i >= 0) bl.splice(i, 1);
+    else {
+      if(state.guests.some(g => g.tableId === tid && g.seat === key)) return { ok: false, msg: 'To miejsce jest zajęte – najpierw zdejmij gościa ze stołu.' };
+      bl.push(key);
+    }
+    t.blocked = bl;
+  });
+}
+
 function addTable(){
   act(() => {
     const z = ui.zoom, k = state.tables.length % 6;
     const t = {
       id: state.nextId++, name: 'Stół ' + (state.tables.length + 1),
       x: snapG(stage.scrollLeft / z + 60 + k * 30), y: snapG(stage.scrollTop / z + 60 + k * 30),
-      n: 5, sides: 2
+      n: 5, sides: 2, rot: 0
     };
     state.tables.push(t);
     ui.selTable = t.id; ui.selGuest = null;
@@ -262,7 +313,7 @@ function addTable(){
 }
 function duplicateTable(t){
   act(() => {
-    const c = { id: state.nextId++, name: t.name + ' (kopia)', x: t.x + 30, y: t.y + 30, n: t.n, sides: t.sides };
+    const c = { id: state.nextId++, name: t.name + ' (kopia)', x: t.x + 30, y: t.y + 30, n: t.n, sides: t.sides, rot: t.rot || 0, blocked: (t.blocked || []).slice() };
     state.tables.push(c);
     ui.selTable = c.id;
   });
@@ -305,10 +356,13 @@ function addGuestsFromText(text){
    Rysowanie
    ========================================================= */
 function render(){
+  if(ui.seatEdit !== ui.selTable) ui.seatEdit = null;   // tryb usuwania miejsc kończy się po zmianie zaznaczenia
   renderStats();
   renderSidebar();
   renderRoom();
   renderCtx();
+  $('#btnHoriz').textContent = horizOn() ? 'Aa Napisy poziomo: wł.' : 'Aa Napisy poziomo: wył.';
+  $('#btnHoriz').classList.toggle('active', horizOn());
   $('#btnUndo').disabled = !undoStack.length;
   $('#btnRedo').disabled = !redoStack.length;
 }
@@ -380,20 +434,24 @@ function tableEl(t){
     for(let i = 0; i < t.n; i++){
       const key = side + i;
       const g = occ.get(t.id + ':' + key);
-      const seat = h('div', { class: 'seat' + (g ? '' : ' empty'), 'data-tid': t.id, 'data-seat': key, 'data-n': i + 1 });
+      const off = !g && (t.blocked || []).includes(key);
+      const seat = h('div', { class: 'seat' + (off ? ' blocked' : (g ? '' : ' empty')), 'data-tid': t.id, 'data-seat': key, 'data-n': i + 1 });
       if(g) seat.append(guestEl(g, true));
       row.append(seat);
     }
     return row;
   };
-  const el = h('div', { class: 'table' + (ui.selTable === t.id ? ' selected' : ''), 'data-tid': t.id });
+  const el = h('div', { class: 'table' + (ui.selTable === t.id ? ' selected' : '') + (ui.seatEdit === t.id ? ' editing' : ''), 'data-tid': t.id });
   el.style.left = t.x + 'px';
   el.style.top = t.y + 'px';
   el.style.width = (t.n * SW) + 'px';
+  applyRot(el, t);
   el.append(seatRow('t'));
   el.append(h('div', { class: 'table-body' },
-    h('div', { class: 'tname', title: t.name }, t.name),
-    h('div', { class: 'tcount' }, usedCount(t) + ' / ' + seatCount(t)),
+    h('div', { class: 'tlabel' },
+      h('div', { class: 'tname', title: t.name }, t.name),
+      h('div', { class: 'tcount' }, usedCount(t) + ' / ' + seatCount(t))),
+    h('div', { class: 'rotate', title: 'Przeciągnij, aby obrócić stół (co 15°, z Shift dowolnie)' }, '⟳'),
     h('div', { class: 'resize', title: 'Przeciągnij, aby zmienić długość stołu' })
   ));
   if(t.sides === 2) el.append(seatRow('b'));
@@ -410,10 +468,12 @@ function renderCtx(){
   ctx.replaceChildren();
   const t = tableById(ui.selTable), g = guestById(ui.selGuest);
   const btn = (label, fn, cls) => h('button', { class: 'btn' + (cls ? ' ' + cls : ''), onclick: fn }, label);
+  const put = (...items) => ctx.append(...items.filter(x => x != null && x !== false));   // pomija puste elementy
 
   if(t){
-    const setN = n => { n = clamp(n, 1, 20); if(n === t.n) return; act(() => { t.n = n; const c = pruneSeats(t); if(c) toast('Goście z usuniętych miejsc wrócili na listę: ' + c); }); };
-    ctx.append(
+    const setN = n => { n = clamp(n, 1, 20); if(n === t.n) return; act(() => { resizeTable(t, n); const c = pruneSeats(t); if(c) toast('Goście z usuniętych miejsc wrócili na listę: ' + c); }); };
+    const setRot = a => act(() => { t.rot = normAngle(a); const p = clampTable(t, t.x, t.y); t.x = p.x; t.y = p.y; });
+    put(
       h('strong', {}, 'Stół'),
       h('input', { type: 'text', class: 'ctx-input', value: t.name, onchange: e => act(() => { t.name = e.target.value.trim() || t.name; }) }),
       h('span', { class: 'label' }, 'Miejsc po stronie:'),
@@ -421,6 +481,13 @@ function renderCtx(){
       h('select', { class: 'ctx-input', value: String(t.sides), onchange: e => act(() => { t.sides = +e.target.value; const c = pruneSeats(t); if(c) toast('Goście z usuniętych miejsc wrócili na listę: ' + c); }) },
         h('option', { value: '2' }, 'Siedzą po obu stronach'),
         h('option', { value: '1' }, 'Siedzą po jednej stronie')),
+      h('span', { class: 'label' }, 'Obrót:'),
+      btn('⟲ 90°', () => setRot((t.rot || 0) - 90)),
+      btn('⟳ 90°', () => setRot((t.rot || 0) + 90)),
+      h('input', { type: 'number', class: 'ctx-input', style: 'width:68px', min: 0, max: 359, step: 15, value: t.rot || 0, title: 'Kąt obrotu w stopniach', onchange: e => setRot(+e.target.value || 0) }),
+      btn(ui.seatEdit === t.id ? '✓ Gotowe' : '✂ Usuń miejsca', () => { ui.seatEdit = ui.seatEdit === t.id ? null : t.id; render(); }, ui.seatEdit === t.id ? 'primary' : ''),
+      ui.seatEdit === t.id ? h('span', { class: 'tag' }, 'Klikaj miejsca, aby je usunąć lub przywrócić') : null,
+      (t.n * (t.sides === 2 ? 2 : 1) - seatCount(t)) > 0 ? btn('Przywróć wszystkie (' + (t.n * (t.sides === 2 ? 2 : 1) - seatCount(t)) + ')', () => act(() => { t.blocked = []; })) : null,
       h('span', { class: 'label' }, usedCount(t) + ' / ' + seatCount(t) + ' zajętych'),
       h('span', { style: 'flex:1' }),
       btn('Duplikuj', () => duplicateTable(t)),
@@ -430,7 +497,7 @@ function renderCtx(){
     const p = g.partnerId ? guestById(g.partnerId) : null;
     const gt = g.tableId != null ? tableById(g.tableId) : null;
     const others = state.guests.filter(x => x.id !== g.id && !x.partnerId).sort(byName);
-    ctx.append(
+    put(
       h('strong', {}, 'Gość'),
       h('input', { type: 'text', class: 'ctx-input', value: g.name, onchange: e => act(() => { g.name = e.target.value.trim() || g.name; }) }),
       gt ? h('span', { class: 'label' }, gt.name + ', ' + seatLabel(gt, g.seat)) : h('span', { class: 'label' }, 'nieposadzony'),
@@ -444,7 +511,7 @@ function renderCtx(){
       btn('Usuń gościa', () => deleteGuest(g), 'danger')
     );
   } else {
-    ctx.append(h('span', { class: 'hint' }, 'Kliknij stół lub gościa, aby go edytować. Gości przeciągaj na miejsca przy stołach, stoły za blat, a długość stołu zmienisz uchwytem po prawej stronie blatu. Ctrl+Z cofa zmiany.'));
+    ctx.append(h('span', { class: 'hint' }, 'Kliknij stół lub gościa, aby go edytować. Gości przeciągaj na miejsca przy stołach, stoły za blat, uchwyt po prawej stronie blatu zmienia długość stołu, a po lewej obraca go. Ctrl+Z cofa zmiany.'));
   }
 }
 
@@ -544,8 +611,8 @@ function startTableDrag(e, tid){
     const dx = (ev.clientX - sx) / ui.zoom, dy = (ev.clientY - sy) / ui.zoom;
     if(!moved && Math.hypot(dx, dy) * ui.zoom < 4) return;
     moved = true;
-    t.x = clamp(snapG(ox + dx), 0, ROOM_W - t.n * SW);
-    t.y = clamp(snapG(oy + dy), 0, ROOM_H - tableHeight(t));
+    const p = clampTable(t, snapG(ox + dx), snapG(oy + dy));
+    t.x = p.x; t.y = p.y;
     el.style.left = t.x + 'px';
     el.style.top = t.y + 'px';
     autoscroll(ev);
@@ -571,17 +638,19 @@ function startResize(e, tid){
   if(ui.selTable !== tid || ui.selGuest != null){ ui.selTable = tid; ui.selGuest = null; }
   const t0 = tableById(tid);
   if(!t0) return;
-  const sx = e.clientX, n0 = t0.n, snap = JSON.stringify(state);
+  const sx = e.clientX, sy = e.clientY, n0 = t0.n, snap = JSON.stringify(state);
+  const th = (t0.rot || 0) * Math.PI / 180, cs = Math.cos(th), sn = Math.sin(th);
   let lastN = n0, removed = 0;
   ui.busy = true;
   render();
   function move(ev){
-    const n = clamp(n0 + Math.round((ev.clientX - sx) / ui.zoom / SW), 1, 20);
+    const proj = ((ev.clientX - sx) * cs + (ev.clientY - sy) * sn) / ui.zoom;   // ruch wzdłuż osi stołu
+    const n = clamp(n0 + Math.round(proj / SW), 1, 20);
     if(n === lastN) return;
     lastN = n;
     state = JSON.parse(snap);          // zawsze liczymy od stanu początkowego
     const t = tableById(tid);
-    t.n = n;
+    resizeTable(t, n);
     removed = pruneSeats(t);
     render();
   }
@@ -603,6 +672,45 @@ function startResize(e, tid){
   window.addEventListener('pointercancel', up);
 }
 
+function startRotate(e, tid){
+  e.preventDefault();
+  if(ui.selTable !== tid || ui.selGuest != null){ ui.selTable = tid; ui.selGuest = null; render(); }
+  const t = tableById(tid);
+  const el = room.querySelector('.table[data-tid="' + tid + '"]');
+  if(!t || !el) return;
+  const snap = JSON.stringify(state);
+  let changed = false;
+  ui.busy = true;
+  function move(ev){
+    const rr = room.getBoundingClientRect();
+    const b = rotBox(t);
+    const cx = rr.left + b.cx * ui.zoom, cy = rr.top + b.cy * ui.zoom;
+    // uchwyt leży na lewym końcu blatu, czyli w kierunku 180° od środka stołu
+    let a = Math.atan2(ev.clientY - cy, ev.clientX - cx) * 180 / Math.PI - 180;
+    const step = ev.shiftKey ? 1 : 15;
+    a = normAngle(Math.round(a / step) * step);
+    if(a === (t.rot || 0)) return;
+    t.rot = a; changed = true;
+    applyRot(el, t);
+  }
+  function up(){
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    ui.busy = false;
+    if(changed){
+      const p = clampTable(t, t.x, t.y); t.x = p.x; t.y = p.y;
+      undoStack.push(snap); redoStack = [];
+      if(undoStack.length > 80) undoStack.shift();
+      save();
+    }
+    render();
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+}
+
 document.addEventListener('pointerdown', e => {
   if(e.button !== 0) return;
   const t = e.target;
@@ -611,8 +719,16 @@ document.addEventListener('pointerdown', e => {
   const a = document.activeElement;
   if(a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) a.blur();
 
+  const seatEl = t.closest('.seat');
+  if(seatEl && ui.seatEdit === +seatEl.dataset.tid){      // tryb usuwania miejsc: klik = usuń / przywróć
+    e.preventDefault();
+    toggleSeat(+seatEl.dataset.tid, seatEl.dataset.seat);
+    return;
+  }
   const guest = t.closest('.guest');
   if(guest){ startGuestPress(e, +guest.dataset.gid); return; }
+  const rotH = t.closest('.rotate');
+  if(rotH){ startRotate(e, +rotH.closest('.table').dataset.tid); return; }
   const handle = t.closest('.resize');
   if(handle){ startResize(e, +handle.closest('.table').dataset.tid); return; }
   const body = t.closest('.table-body');
@@ -646,8 +762,9 @@ function contentBBox(){
   if(!state.tables.length) return null;
   let x1 = 1e9, y1 = 1e9, x2 = 0, y2 = 0;
   state.tables.forEach(t => {
-    x1 = Math.min(x1, t.x); y1 = Math.min(y1, t.y);
-    x2 = Math.max(x2, t.x + t.n * SW); y2 = Math.max(y2, t.y + tableHeight(t));
+    const b = rotBox(t);
+    x1 = Math.min(x1, b.cx - b.hw); y1 = Math.min(y1, b.cy - b.hh);
+    x2 = Math.max(x2, b.cx + b.hw); y2 = Math.max(y2, b.cy + b.hh);
   });
   return { x1, y1, x2, y2 };
 }
@@ -713,6 +830,7 @@ $('#btnRedo').onclick = redo;
 $('#btnZoomIn').onclick = () => setZoom(ui.zoom * 1.15);
 $('#btnZoomOut').onclick = () => setZoom(ui.zoom / 1.15);
 $('#btnFit').onclick = fit;
+$('#btnHoriz').onclick = () => { state.horizText = !horizOn(); save(); render(); };
 $('#btnCsv').onclick = exportCsv;
 $('#btnPrint').onclick = () => window.print();
 $('#btnExport').onclick = exportJson;
