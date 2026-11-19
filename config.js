@@ -3,5 +3,5 @@
    Przykład: 'https://moje-wesele-default-rtdb.europe-west1.firebasedatabase.app'
    Zostaw puste, aby plan zapisywał się tylko w tej przeglądarce. */
 window.WESELE_CONFIG = {
-  databaseURL: ''
+  databaseURL: 'https://wesele-ce289-default-rtdb.europe-west1.firebasedatabase.app'
 };
